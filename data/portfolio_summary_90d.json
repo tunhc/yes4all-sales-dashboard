@@ -1,0 +1,17 @@
+{
+  "analysis_start": "2026-06-11",
+  "analysis_end": "2026-09-08",
+  "comparison_start": "2025-06-11",
+  "comparison_end": "2025-09-08",
+  "portfolio_gmv": 1107306.37,
+  "portfolio_units": 49587.0,
+  "portfolio_nmv": 1038977.15,
+  "portfolio_ads": 59252.51,
+  "portfolio_promo": 70534.68,
+  "portfolio_gmv_yoy_pct": -60.28017442602967,
+  "product_line_count": 20,
+  "sku_count": 163,
+  "top_product_line": "Standard Dumbbells",
+  "top_sku": "DXD3",
+  "top_10_sku_gmv_share_pct": 51.01676422217276
+}
