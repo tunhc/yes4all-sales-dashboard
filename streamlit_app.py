@@ -33,6 +33,8 @@ PALETTE = {
     "grid": "#E2E8F0",
 }
 
+CANDIDATE_MODELS = ["Naive", "MA3", "ETS", "SARIMA", "Prophet", "LightGBM_Global", "Ens_ETS_LGBM", "Ens_Median4"]
+
 
 st.markdown(
     """
@@ -87,6 +89,8 @@ st.markdown(
 
 def bundle_path() -> Path:
     candidates = [
+        Path(__file__).resolve().parent / "app_data_v3.zip",
+        Path(__file__).resolve().parent / "data" / "app_data_v3.zip",
         Path(__file__).resolve().parent / "app_data_v2.zip",
         Path(__file__).resolve().parent / "data" / "app_data_v2.zip",
         Path.cwd() / "app_data_v2.zip",
@@ -108,7 +112,7 @@ def load_bundle(path: str, modified_ns: int) -> tuple[dict[str, pd.DataFrame], d
                 tables[name.removesuffix(".parquet")] = pd.read_parquet(io.BytesIO(archive.read(name)))
         quality = json.loads(archive.read("quality_summary.json").decode("utf-8"))
     for frame in tables.values():
-        for column in ["Day", "month", "snapshot_date"]:
+        for column in ["Day", "month", "Month", "snapshot_date"]:
             if column in frame.columns:
                 frame[column] = pd.to_datetime(frame[column], errors="coerce")
     return tables, quality
@@ -235,13 +239,14 @@ def build_action_queue(tables: dict[str, pd.DataFrame], acos_limit: float = 0.35
 
 DATA_PATH = bundle_path()
 TABLES, QUALITY = load_bundle(str(DATA_PATH), DATA_PATH.stat().st_mtime_ns)
-SALES = TABLES["sales_current"]
+CURRENT_SALES = TABLES["sales_current"]
+SALES = TABLES["sales_commercial_monthly"]
 
 st.markdown(
     f"""
     <div class="app-header">
       <h1>Yes4All Commerce Intelligence</h1>
-      <p>Sales, inventory, target, ads and action center · Actuals through {QUALITY['latest_sales_date']}</p>
+      <p>Commercial Intelligence · Sales history {QUALITY['commercial_sales_min']} → {QUALITY['latest_sales_date']} · Monthly through Aug-2026 + retained Sep-2026 MTD</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -249,8 +254,8 @@ st.markdown(
 
 page = st.segmented_control(
     "Navigation",
-    ["Executive Overview", "ASIN 360", "Inventory & Forecast", "Sales & Target", "Ads Performance", "Action Center", "Data Quality"],
-    default="Executive Overview",
+    ["Commercial Intelligence", "Daily Forecast & Supply", "ASIN 360", "Inventory & Forecast", "Sales & Target", "Ads Performance", "Action Center", "Data Quality"],
+    default="Commercial Intelligence",
     label_visibility="collapsed",
 )
 
@@ -258,7 +263,7 @@ date_min = SALES["Day"].min().date()
 date_max = SALES["Day"].max().date()
 with st.container():
     st.markdown('<div class="filter-shell">', unsafe_allow_html=True)
-    row1 = st.columns([1.3, 1.6, 1.2, 1.15, 1.55], gap="small")
+    row1 = st.columns([1.3, 1.45, 1.15, 1.05, 1.8], gap="small")
     with row1[0]:
         selected_dates = st.date_input("Time range", value=(date_min, date_max), min_value=date_min, max_value=date_max)
     all_product_lines = sorted(SALES["product_line"].dropna().astype(str).unique().tolist())
@@ -269,21 +274,39 @@ with st.container():
     with row1[3]:
         selected_channels = st.multiselect("Channel", sorted(SALES["channel"].dropna().astype(str).unique()), placeholder="All channels")
     with row1[4]:
-        search_text = st.text_input("Search", placeholder="Product name, SKU, ASIN...")
+        search_text = st.text_input("Fast search", placeholder="Type SKU, ASIN, product or keyword...", help="Searches a compact index and returns at most 50 matches; it does not render a full SKU list.")
 
-    prefiltered = apply_dimensions(SALES, selected_product_lines, selected_teams, selected_channels, [], [], search_text)
-    row2 = st.columns([1.3, 1.6, 1.2, 1.15, 1.55], gap="small")
+    search_source = TABLES.get("sales_team_daily", SALES)
+    search_columns = [c for c in ["SKU", "ASIN", "product_name", "product_line", "team", "channel"] if c in search_source]
+    search_index = search_source[search_columns].fillna("").astype(str).drop_duplicates().reset_index(drop=True)
+    search_index["_label"] = search_index.apply(
+        lambda r: f"{r.get('SKU', '')} · {r.get('ASIN', '')} · {str(r.get('product_name', ''))[:72]}", axis=1
+    )
+    matches = search_index.iloc[0:0]
+    if len(search_text.strip()) >= 2:
+        needle = search_text.strip().lower()
+        haystack = search_index[search_columns].agg(" | ".join, axis=1).str.lower()
+        matches = search_index[haystack.str.contains(needle, regex=False, na=False)].head(50)
+
+    row2 = st.columns([2.9, 1.2, 1.2, 1.7], gap="small")
     with row2[0]:
-        selected_skus = st.multiselect("SKU", sorted(prefiltered["SKU"].dropna().astype(str).unique()), placeholder="All SKUs")
-    asin_pool = prefiltered[prefiltered["SKU"].astype(str).isin(selected_skus)] if selected_skus else prefiltered
+        result_options = [None] + matches.index.tolist()
+        selected_result = st.selectbox(
+            "Matching product",
+            result_options,
+            format_func=lambda i: "All matching products" if i is None else search_index.loc[i, "_label"],
+            disabled=len(matches) == 0,
+        )
+    selected_skus = [] if selected_result is None else [str(search_index.loc[selected_result, "SKU"])]
+    selected_asins = [] if selected_result is None else [str(search_index.loc[selected_result, "ASIN"])]
+    effective_search = search_text if selected_result is None else ""
     with row2[1]:
-        selected_asins = st.multiselect("ASIN", sorted(asin_pool["ASIN"].dropna().astype(str).unique()), placeholder="All ASINs")
-    with row2[2]:
         listing_status_filter = st.multiselect("Listing status", ["Active", "Active with ZIP restriction", "Active with long delivery", "Blocked"], placeholder="All statuses")
-    with row2[3]:
+    with row2[2]:
         ad_account_filter = st.multiselect("Ads account", sorted(TABLES["ads_campaign"]["Account"].dropna().astype(str).unique()), default=["Yes4All [US]"] if "Yes4All [US]" in set(TABLES["ads_campaign"]["Account"].astype(str)) else [])
-    with row2[4]:
-        st.caption(f"Coverage: {QUALITY['sales_sku']:,}/{QUALITY['target_sku']:,} target SKUs · Inventory map {QUALITY['inventory_target_sku_coverage']:.1%}")
+    with row2[3]:
+        match_note = f"{len(matches)} results (showing max 50)" if len(search_text.strip()) >= 2 else "Type at least 2 characters"
+        st.caption(f"Fast index: {match_note} · Daily scope {QUALITY.get('daily_sku', 0):,} SKUs")
     st.markdown("</div>", unsafe_allow_html=True)
 
 if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
@@ -291,67 +314,185 @@ if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
 else:
     start_date = end_date = selected_dates if not isinstance(selected_dates, tuple) else date_max
 
-filtered_sales = apply_dimensions(SALES, selected_product_lines, selected_teams, selected_channels, selected_skus, selected_asins, search_text)
+filtered_sales = apply_dimensions(SALES, selected_product_lines, selected_teams, selected_channels, selected_skus, selected_asins, effective_search)
 filtered_sales = filter_dates(filtered_sales, start_date, end_date)
 
 if filtered_sales.empty and page not in {"Ads Performance", "Data Quality"}:
     st.warning("Không có dữ liệu sales trong tổ hợp filter hiện tại. Hãy bỏ bớt filter hoặc đổi khoảng ngày.")
 
 
-def executive_overview() -> None:
+def commercial_intelligence() -> None:
     current = filtered_sales
     gmv = current["Ordered_GMV"].sum()
     nmv = current["Ordered_nmv"].sum()
     units = current["Ordered_units"].sum()
+    views = current["Glance_views"].sum()
     ads = current["Total_ADS"].sum()
     promo = current["Total_Promo"].sum()
-    acos = safe_divide(ads, nmv)
-    columns = st.columns(6)
+    ad_units = current["Ad_attributed_units"].sum()
+    asp = safe_divide(gmv, units)
+    mkt = ads + promo
+    mkt_gmv = safe_divide(mkt, gmv)
+    ads_gmv = safe_divide(ads, gmv)
+    promo_gmv = safe_divide(promo, gmv)
+    cpu = safe_divide(mkt, units)
+
+    prior_start = pd.Timestamp(start_date) - pd.DateOffset(years=1)
+    prior_end = pd.Timestamp(end_date) - pd.DateOffset(years=1)
+    prior = filter_dates(apply_dimensions(SALES, selected_product_lines, selected_teams, selected_channels, selected_skus, selected_asins, search_text), prior_start, prior_end)
+
+    def yoy_delta(current_value: float, prior_value: float) -> str | None:
+        if prior_value is None or pd.isna(prior_value) or prior_value == 0:
+            return None
+        return f"{current_value / prior_value - 1:+.1%} YoY"
+
+    prior_gmv = prior["Ordered_GMV"].sum()
+    prior_units = prior["Ordered_units"].sum()
+    prior_ads = prior["Total_ADS"].sum()
+    prior_promo = prior["Total_Promo"].sum()
+    prior_asp = safe_divide(prior_gmv, prior_units)
+    prior_mkt_gmv = safe_divide(prior_ads + prior_promo, prior_gmv)
+
+    columns = st.columns(4)
     values = [
-        ("Ordered GMV", fmt_money(gmv)), ("Ordered NMV", fmt_money(nmv)),
-        ("Total units", fmt_number(units)), ("Ad spend", fmt_money(ads)),
-        ("Promo spend", fmt_money(promo)), ("ACOS proxy", fmt_pct(acos)),
+        ("Ordered GMV", fmt_money(gmv), yoy_delta(gmv, prior_gmv)),
+        ("Ordered units", fmt_number(units), yoy_delta(units, prior_units)),
+        ("ASP", fmt_money(asp), yoy_delta(asp, prior_asp)),
+        ("Glance views", fmt_number(views), None),
     ]
-    for column, (label, value) in zip(columns, values):
-        column.metric(label, value)
+    for column, (label, value, delta) in zip(columns, values):
+        column.metric(label, value, delta=delta)
+    columns = st.columns(4)
+    values = [
+        ("Ad spend / GMV", fmt_pct(ads_gmv), yoy_delta(ads_gmv, safe_divide(prior_ads, prior_gmv))),
+        ("Promo / GMV", fmt_pct(promo_gmv), yoy_delta(promo_gmv, safe_divide(prior_promo, prior_gmv))),
+        ("MKT / GMV", fmt_pct(mkt_gmv), yoy_delta(mkt_gmv, prior_mkt_gmv)),
+        ("MKT CPU", fmt_money(cpu), None),
+    ]
+    for column, (label, value, delta) in zip(columns, values):
+        column.metric(label, value, delta=delta, delta_color="inverse" if label in {"Ad spend / GMV", "Promo / GMV", "MKT / GMV", "MKT CPU"} else "normal")
 
     scope_days = max((pd.Timestamp(end_date) - pd.Timestamp(start_date)).days + 1, 1)
     st.markdown(
-        f'<div class="callout"><b>Current view:</b> {scope_days} days, {current["SKU"].nunique():,} SKUs and {current["ASIN"].nunique():,} ASINs. '
-        f'ACOS proxy uses total ad spend ÷ ordered NMV, not campaign-attributed sales.</div>',
+        f'<div class="callout"><b>Current view:</b> {scope_days} calendar days, {current["SKU"].nunique():,} SKUs and {current["ASIN"].nunique():,} ASINs. '
+        f'Paid-attributed units: {ad_units:,.0f}. September 2026 is partial through {QUALITY["latest_sales_date"]}; YoY that includes September is therefore directional.</div>',
         unsafe_allow_html=True,
     )
 
-    daily = current.groupby("Day", as_index=False).agg(GMV=("Ordered_GMV", "sum"), Units=("Ordered_units", "sum"), Ads=("Total_ADS", "sum"))
-    left, right = st.columns([1.65, 1], gap="large")
+    monthly = current.groupby("Day", as_index=False).agg(
+        GMV=("Ordered_GMV", "sum"), Units=("Ordered_units", "sum"), Views=("Glance_views", "sum"),
+        Ads=("Total_ADS", "sum"), Promo=("Total_Promo", "sum"), Ad_units=("Ad_attributed_units", "sum"),
+    )
+    monthly["ASP"] = np.where(monthly["Units"] != 0, monthly["GMV"] / monthly["Units"], np.nan)
+    monthly["MKT_GMV"] = np.where(monthly["GMV"] > 0, (monthly["Ads"] + monthly["Promo"]) / monthly["GMV"], np.nan)
+    left, right = st.columns([1.6, 1], gap="large")
     with left:
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=daily["Day"], y=daily["GMV"], name="GMV", marker_color=PALETTE["blue"]))
-        fig.add_trace(go.Scatter(x=daily["Day"], y=daily["Units"], name="Units", yaxis="y2", mode="lines+markers", line=dict(color=PALETTE["teal"], width=3)))
-        fig.update_layout(title="Daily sales trajectory", yaxis=dict(title="GMV (USD)"), yaxis2=dict(title="Units", overlaying="y", side="right", showgrid=False))
+        fig.add_trace(go.Bar(x=monthly["Day"], y=monthly["GMV"], name="GMV", marker_color=PALETTE["blue"]))
+        fig.add_trace(go.Scatter(x=monthly["Day"], y=monthly["Units"], name="Units", yaxis="y2", mode="lines+markers", line=dict(color=PALETTE["teal"], width=3)))
+        fig.update_layout(title="Monthly GMV and units", yaxis=dict(title="GMV (USD)"), yaxis2=dict(title="Units", overlaying="y", side="right", showgrid=False))
         st.plotly_chart(chart_style(fig, 410), width="stretch")
     with right:
-        by_line = current.groupby("product_line", as_index=False).agg(GMV=("Ordered_GMV", "sum"), Units=("Ordered_units", "sum")).nlargest(12, "GMV").sort_values("GMV")
-        fig = px.bar(by_line, x="GMV", y="product_line", orientation="h", color="Units", color_continuous_scale=["#DBEAFE", "#2563EB"], title="Top product lines by GMV")
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=monthly["Day"], y=monthly["Ads"], name="Ads", marker_color=PALETTE["purple"]))
+        fig.add_trace(go.Bar(x=monthly["Day"], y=monthly["Promo"], name="Promo", marker_color=PALETTE["amber"]))
+        fig.add_trace(go.Scatter(x=monthly["Day"], y=monthly["MKT_GMV"], name="MKT / GMV", yaxis="y2", line=dict(color=PALETTE["red"], width=3)))
+        fig.update_layout(title="Marketing investment and efficiency", barmode="stack", yaxis=dict(title="Spend (USD)"), yaxis2=dict(title="MKT / GMV", overlaying="y", side="right", tickformat=".0%", showgrid=False))
         st.plotly_chart(chart_style(fig, 410), width="stretch")
 
-    performance = apply_dimensions(TABLES["performance_mtd"], selected_product_lines, selected_teams, selected_channels, selected_skus, [], search_text)
-    performance = performance[performance["unit_target_oct"] > 0].copy()
-    if not performance.empty:
-        performance["pace_gap"] = performance["unit_attainment"] - (pd.Timestamp(end_date).day / 31)
-        risk = performance.nsmallest(15, "pace_gap")
-        section("Target pace exceptions", "MTD actual units versus a linear October target pace. September actuals are used only as the latest available operating signal.")
-        st.dataframe(
-            risk[["SKU", "product_name", "product_line", "actual_units_mtd", "unit_target_oct", "unit_attainment", "sell_through_proxy"]],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "actual_units_mtd": st.column_config.NumberColumn("Actual units"),
-                "unit_target_oct": st.column_config.NumberColumn("Oct target"),
-                "unit_attainment": st.column_config.ProgressColumn("Attainment", min_value=0, max_value=1, format="percent"),
-                "sell_through_proxy": st.column_config.NumberColumn("Sell-through proxy", format="percent"),
-            },
-        )
+    section("Portfolio map", "Bubble size = ordered units; color = MKT/GMV. Use PIC and Product Line filters above to isolate ownership.")
+    by_line = current.groupby(["team", "product_line"], as_index=False).agg(
+        GMV=("Ordered_GMV", "sum"), Units=("Ordered_units", "sum"), Ads=("Total_ADS", "sum"),
+        Promo=("Total_Promo", "sum"), Views=("Glance_views", "sum"), Ad_units=("Ad_attributed_units", "sum"),
+    )
+    by_line["ASP"] = np.where(by_line["Units"] != 0, by_line["GMV"] / by_line["Units"], np.nan)
+    by_line["MKT_GMV"] = np.where(by_line["GMV"] > 0, (by_line["Ads"] + by_line["Promo"]) / by_line["GMV"], np.nan)
+    fig = px.scatter(
+        by_line[(by_line["GMV"] > 0) & (by_line["Units"] > 0)], x="Units", y="GMV", size="Units", color="MKT_GMV",
+        hover_name="product_line", hover_data=["team", "ASP", "Ads", "Promo", "Ad_units"],
+        color_continuous_scale=["#16A34A", "#F59E0B", "#DC2626"], title="Product Line scale × GMV × marketing intensity",
+    )
+    st.plotly_chart(chart_style(fig, 500), width="stretch")
+
+    section("Commercial relationship map", "Spearman correlation across SKU-month-ASIN rows. Correlation is descriptive; it does not prove Ads or Promo caused sales.")
+    correlation_fields = {
+        "Views": "Glance_views", "Units": "Ordered_units", "GMV": "Ordered_GMV", "ASP": "ASP",
+        "Ads": "Total_ADS", "Promo": "Total_Promo", "Ad units": "Ad_attributed_units",
+        "Ads/GMV": "Ads_pct_GMV", "Promo/GMV": "Promo_pct_GMV", "MKT CPU": "MKT_CPU",
+    }
+    corr_source = current[list(correlation_fields.values())].replace([np.inf, -np.inf], np.nan)
+    corr_source = corr_source.dropna(how="all")
+    corr = corr_source.corr(method="spearman", min_periods=30)
+    corr.index = correlation_fields.keys()
+    corr.columns = correlation_fields.keys()
+    c1, c2 = st.columns([1.3, 1], gap="large")
+    with c1:
+        fig = px.imshow(corr, text_auto=".2f", zmin=-1, zmax=1, color_continuous_scale="RdBu_r", title="Correlation matrix")
+        st.plotly_chart(chart_style(fig, 520), width="stretch")
+    with c2:
+        relationship_rows = [
+            {"Relationship": "Views → Units", "What it means": "Traffic-to-demand linkage; read together with conversion proxy."},
+            {"Relationship": "ASP ↔ Units", "What it means": "Price-volume co-movement; negative can signal price sensitivity or mix shift."},
+            {"Relationship": "Ads → Ad units", "What it means": "Paid acquisition scale; evaluate with attributed CPU and ROAS."},
+            {"Relationship": "Ads → GMV", "What it means": "Commercial co-movement; large SKUs naturally spend and sell more."},
+            {"Relationship": "Promo → Units", "What it means": "Promotion intensity versus volume; not a causal uplift estimate."},
+            {"Relationship": "MKT CPU → GMV", "What it means": "Cost required per ordered unit versus achieved scale."},
+        ]
+        st.dataframe(pd.DataFrame(relationship_rows), width="stretch", hide_index=True, height=480)
+
+    section("PIC scorecard")
+    pic = current.groupby("team", as_index=False).agg(
+        GMV=("Ordered_GMV", "sum"), Units=("Ordered_units", "sum"), Ads=("Total_ADS", "sum"),
+        Promo=("Total_Promo", "sum"), Ad_units=("Ad_attributed_units", "sum"), SKU=("SKU", "nunique"),
+    )
+    pic["ASP"] = np.where(pic["Units"] != 0, pic["GMV"] / pic["Units"], np.nan)
+    pic["Ads_GMV"] = np.where(pic["GMV"] > 0, pic["Ads"] / pic["GMV"], np.nan)
+    pic["Promo_GMV"] = np.where(pic["GMV"] > 0, pic["Promo"] / pic["GMV"], np.nan)
+    pic["MKT_GMV"] = np.where(pic["GMV"] > 0, (pic["Ads"] + pic["Promo"]) / pic["GMV"], np.nan)
+    pic["MKT_CPU"] = np.where(pic["Units"] > 0, (pic["Ads"] + pic["Promo"]) / pic["Units"], np.nan)
+    st.dataframe(pic.sort_values("GMV", ascending=False), width="stretch", hide_index=True, column_config={
+        "GMV": st.column_config.NumberColumn(format="$%.0f"), "ASP": st.column_config.NumberColumn(format="$%.2f"),
+        "Ads": st.column_config.NumberColumn(format="$%.0f"), "Promo": st.column_config.NumberColumn(format="$%.0f"),
+        "Ads_GMV": st.column_config.NumberColumn("Ads / GMV", format="percent"),
+        "Promo_GMV": st.column_config.NumberColumn("Promo / GMV", format="percent"),
+        "MKT_GMV": st.column_config.NumberColumn("MKT / GMV", format="percent"),
+        "MKT_CPU": st.column_config.NumberColumn(format="$%.2f"),
+    })
+
+    section("Sales investment planner", "Example: choose 10 units and $25 ASP. Budgets use historical ratios in the filtered scope; they are planning benchmarks, not guaranteed causal requirements.")
+    calc_cols = st.columns([1, 1, 1.2])
+    with calc_cols[0]:
+        desired_units = st.number_input("Desired units", min_value=1, value=10, step=1)
+    with calc_cols[1]:
+        selling_price = st.number_input("Planned ASP (USD)", min_value=0.01, value=25.0, step=1.0)
+    with calc_cols[2]:
+        benchmark = st.selectbox("Benchmark window", ["Selected scope", "Latest 6 months in selected scope"])
+    benchmark_data = current.copy()
+    if benchmark.startswith("Latest 6") and not current.empty:
+        cutoff = current["Day"].max() - pd.DateOffset(months=5)
+        benchmark_data = current[current["Day"].ge(cutoff)]
+    bench_gmv = benchmark_data["Ordered_GMV"].sum()
+    bench_units = benchmark_data["Ordered_units"].sum()
+    bench_ads = benchmark_data["Total_ADS"].sum()
+    bench_promo = benchmark_data["Total_Promo"].sum()
+    bench_ad_units = benchmark_data["Ad_attributed_units"].sum()
+    target_gmv = float(desired_units) * float(selling_price)
+    rate_ads = safe_divide(bench_ads, bench_gmv)
+    rate_promo = safe_divide(bench_promo, bench_gmv)
+    estimated_ads = target_gmv * (0 if pd.isna(rate_ads) else rate_ads)
+    estimated_promo = target_gmv * (0 if pd.isna(rate_promo) else rate_promo)
+    estimated_mkt = estimated_ads + estimated_promo
+    estimated_paid_units = desired_units * (0 if pd.isna(safe_divide(bench_ad_units, bench_units)) else safe_divide(bench_ad_units, bench_units))
+    planner_cards = st.columns(6)
+    planner_values = [
+        ("Target GMV", fmt_money(target_gmv)), ("Ads benchmark", fmt_money(estimated_ads)),
+        ("Promo benchmark", fmt_money(estimated_promo)), ("Total MKT", fmt_money(estimated_mkt)),
+        ("MKT CPU", fmt_money(safe_divide(estimated_mkt, desired_units))),
+        ("Expected paid-attributed units", fmt_number(estimated_paid_units, 1)),
+    ]
+    for column, (label, value) in zip(planner_cards, planner_values):
+        column.metric(label, value)
+    st.caption("Promo Units are not calculated because the source has no promotion-attributed unit field. Ads attributed units are source-backed from SB/SD/SP/DSP/Aff.")
 
 
 def asin_360() -> None:
@@ -424,11 +565,11 @@ def asin_360() -> None:
             st.caption("SIMULATED: rank and search volume are deterministic demo values. Lower rank is better.")
     with tabs[3]:
         campaigns = TABLES["ads_asin_campaign"]
-        campaigns = campaigns[campaigns["ASIN"].astype(str).eq(str(selected))].sort_values("spend", ascending=False)
+        campaigns = campaigns[campaigns["ASIN"].astype(str).eq(str(selected))].sort_values("SpendUSD", ascending=False)
         if campaigns.empty:
             st.info("No campaign-to-ASIN mapping found in the audit workbook.")
         else:
-            st.dataframe(campaigns[["campaignName", "Account", "programType", "state", "spend", "sales", "orders", "ACOS", "campaign_action", "AuditFlags"]], width="stretch", hide_index=True, column_config={"ACOS": st.column_config.NumberColumn(format="percent")})
+            st.dataframe(campaigns[["campaignName", "Account", "programType", "state", "SpendUSD", "SalesUSD", "ACOS", "ROAS", "campaign_action", "AuditFlags"]], width="stretch", hide_index=True, column_config={"ACOS": st.column_config.NumberColumn(format="percent"), "ROAS": st.column_config.NumberColumn(format="%.2f")})
     with tabs[4]:
         actions = build_action_queue(TABLES)
         entity_actions = actions[(actions["Entity"].astype(str).eq(str(selected))) | (actions["SKU"].astype(str).eq(sku))]
@@ -540,7 +681,7 @@ def ads_performance() -> None:
         fig = go.Figure()
         fig.add_trace(go.Bar(x=daily["Day"], y=daily["Ad_spend"], name="Ad spend", marker_color=PALETTE["purple"]))
         fig.add_trace(go.Scatter(x=daily["Day"], y=daily["ACOS_proxy"], name="ACOS proxy", yaxis="y2", line=dict(color=PALETTE["red"], width=3)))
-        fig.update_layout(title="Daily ads trend", yaxis=dict(title="Spend (USD)"), yaxis2=dict(title="ACOS", overlaying="y", side="right", tickformat=".0%", showgrid=False))
+        fig.update_layout(title="Monthly ads trend", yaxis=dict(title="Spend (USD)"), yaxis2=dict(title="ACOS", overlaying="y", side="right", tickformat=".0%", showgrid=False))
         st.plotly_chart(chart_style(fig, 430), width="stretch")
     section("Campaign action queue")
     action_ads = ads[ads["campaign_action"] != "Monitor"].sort_values("SpendUSD", ascending=False)
@@ -569,15 +710,154 @@ def action_center() -> None:
     st.dataframe(actions, width="stretch", hide_index=True, height=640)
 
 
+def daily_forecast_supply() -> None:
+    daily = apply_dimensions(
+        TABLES["sales_team_daily"], selected_product_lines, selected_teams, selected_channels,
+        selected_skus, [], effective_search,
+    )
+    daily = filter_dates(daily, start_date, end_date)
+    scope_skus = sorted(daily["SKU"].dropna().astype(str).unique())
+    selection = TABLES["forecast_auto_selection"]
+    selection = selection[selection["SKU"].astype(str).isin(scope_skus)].copy()
+    future = TABLES["forecast_future_auto"]
+    future = future[future["SKU"].astype(str).isin(scope_skus)].copy()
+    status = TABLES["forecast_sku_status"]
+    status = status[status["SKU"].astype(str).isin(scope_skus)].copy()
+
+    section("Daily Forecast & Supply", "Daily demand history + automatic model selection by SKU + inventory-constrained fulfillment")
+    st.markdown(
+        '<div class="callout"><b>Forecast gate:</b> select the lowest-WAPE model per SKU among models with |Bias| ≤ 20% and at least 18 valid backtest points. OOS-suspect months are excluded. If evidence is insufficient, fall back to the product-group/workbook rule. Inventory never changes demand forecast.</div>',
+        unsafe_allow_html=True,
+    )
+    if not scope_skus:
+        st.warning("No SKU matches the current filters.")
+        return
+
+    if len(scope_skus) > 1 and not selected_skus:
+        cards = st.columns(5)
+        cards[0].metric("SKUs in daily scope", f"{len(scope_skus):,}")
+        cards[1].metric("Daily rows", f"{len(daily):,}")
+        cards[2].metric("Median selected WAPE", fmt_pct(selection["WAPE"].median()))
+        cards[3].metric("Median |Bias|", fmt_pct(selection["Bias"].abs().median()))
+        cards[4].metric("6M demand forecast", fmt_number(future["Forecast_unconstrained"].sum()))
+        left, right = st.columns([1, 1.45], gap="large")
+        with left:
+            counts = selection["Selected_model"].fillna("Status rule").value_counts().rename_axis("Model").reset_index(name="SKU")
+            fig = px.bar(counts, x="SKU", y="Model", orientation="h", color="SKU", title="Selected model distribution", color_continuous_scale="Blues")
+            st.plotly_chart(chart_style(fig, 430), width="stretch")
+        with right:
+            plot = selection.dropna(subset=["WAPE", "Bias"]).merge(status[["SKU", "Demand_class", "Main_PL"]], on="SKU", how="left")
+            fig = px.scatter(plot, x="Bias", y="WAPE", color="Demand_class", hover_name="SKU", hover_data=["Selected_model", "Main_PL", "N"], title="Reliability map — WAPE vs Bias")
+            fig.add_vline(x=-0.20, line_dash="dash", line_color=PALETTE["amber"])
+            fig.add_vline(x=0.20, line_dash="dash", line_color=PALETTE["amber"])
+            st.plotly_chart(chart_style(fig, 430), width="stretch")
+        st.caption("Use Fast search above and select one result to open its forecast and inventory runway.")
+        st.dataframe(selection.sort_values("WAPE", ascending=False).head(40), width="stretch", hide_index=True)
+        return
+
+    sku = selected_skus[0] if selected_skus else scope_skus[0]
+    daily = daily[daily["SKU"].astype(str).eq(sku)].copy()
+    future = future[future["SKU"].astype(str).eq(sku)].sort_values("Month").copy()
+    selection = selection[selection["SKU"].astype(str).eq(sku)]
+    status = status[status["SKU"].astype(str).eq(sku)]
+    product_mode = daily["product_name"].dropna().astype(str).mode()
+    product = product_mode.iloc[0] if not product_mode.empty else ""
+    asin_text = ", ".join(sorted(daily["ASIN"].dropna().astype(str).unique())[:5])
+    st.markdown(f"### {sku} · {product}")
+    st.caption(f"ASIN: {asin_text or '—'}")
+
+    last_day = daily["Day"].max()
+    recent = daily[daily["Day"] > last_day - pd.Timedelta(days=28)]
+    prior = daily[(daily["Day"] <= last_day - pd.Timedelta(days=28)) & (daily["Day"] > last_day - pd.Timedelta(days=56))]
+    recent_units, prior_units = recent["Ordered_units"].sum(), prior["Ordered_units"].sum()
+    sel = selection.iloc[0] if not selection.empty else pd.Series(dtype=object)
+    stat = status.iloc[0] if not status.empty else pd.Series(dtype=object)
+    cards = st.columns(7)
+    cards[0].metric("Units · last 28D", fmt_number(recent_units), None if prior_units == 0 else f"{recent_units / prior_units - 1:+.1%} vs prior 28D")
+    cards[1].metric("GMV · last 28D", fmt_money(recent["Ordered_GMV"].sum()))
+    cards[2].metric("ASP", fmt_money(safe_divide(recent["Ordered_GMV"].sum(), recent_units)))
+    cards[3].metric("Selected model", str(sel.get("Selected_model", "Status rule")))
+    cards[4].metric("WAPE", fmt_pct(sel.get("WAPE", np.nan)))
+    cards[5].metric("Bias", fmt_pct(sel.get("Bias", np.nan)))
+    cards[6].metric("MAPE*", fmt_pct(sel.get("MAPE", np.nan)))
+    st.caption("* MAPE excludes zero-actual observations and is diagnostic only; WAPE is the primary accuracy metric.")
+
+    day = daily.groupby("Day", as_index=False)[["Ordered_units", "Ordered_GMV", "Total_ADS", "Total_Promo"]].sum().sort_values("Day")
+    day["Units · 7D MA"] = day["Ordered_units"].rolling(7, min_periods=1).mean()
+    fig = go.Figure()
+    fig.add_bar(x=day["Day"], y=day["Ordered_units"], name="Daily units", marker_color="#BFDBFE")
+    fig.add_scatter(x=day["Day"], y=day["Units · 7D MA"], name="7-day moving average", line=dict(color=PALETTE["blue"], width=3))
+    fig.update_layout(title="Daily demand and 7-day signal", barmode="overlay")
+    st.plotly_chart(chart_style(fig, 400), width="stretch")
+
+    actual_month = daily.assign(Month=daily["Day"].dt.to_period("M").dt.to_timestamp()).groupby("Month", as_index=False)["Ordered_units"].sum()
+    left, right = st.columns([1.4, 1], gap="large")
+    with left:
+        fig = go.Figure()
+        fig.add_scatter(x=actual_month["Month"], y=actual_month["Ordered_units"], name="Actual units", line=dict(color=PALETTE["navy"], width=3))
+        fig.add_scatter(x=future["Month"], y=future["Forecast_unconstrained"], name="Auto demand forecast", mode="lines+markers", line=dict(color=PALETTE["teal"], width=3, dash="dash"))
+        if future["P80"].notna().any():
+            fig.add_scatter(x=future["Month"], y=future["P80"], name="P80 planning band", line=dict(color=PALETTE["amber"], dash="dot"))
+        fig.update_layout(title="Monthly actual vs unconstrained demand forecast", yaxis_title="Units")
+        st.plotly_chart(chart_style(fig, 430), width="stretch")
+    with right:
+        models = TABLES["forecast_all_models"]
+        models = models[models["SKU"].astype(str).eq(sku)].copy()
+        available = [m for m in CANDIDATE_MODELS if m in models and models[m].notna().any()]
+        if available:
+            long = models.melt(id_vars=["Month"], value_vars=available, var_name="Model", value_name="Forecast")
+            fig = px.line(long, x="Month", y="Forecast", color="Model", markers=True, title="Candidate model forecasts")
+            st.plotly_chart(chart_style(fig, 430), width="stretch")
+        else:
+            st.info("This SKU uses a lifecycle/status rule rather than a trained model.")
+
+    section("Inventory-constrained fulfillment", "Demand stays unchanged; inventory only limits the fulfillable target.")
+    controls = st.columns([1.35, 1, 2.2])
+    with controls[0]:
+        include_incoming = st.toggle("Block incoming into 3-month plan", value=True, help="Include aggregate incoming in the planning block.")
+    with controls[1]:
+        receipt_month = st.selectbox("Assumed receipt month", [1, 2, 3], index=2, disabled=not include_incoming)
+    with controls[2]:
+        st.caption("The source has no PO-level ETA. Conservative default: all incoming becomes usable in month 3.")
+
+    on_hand, incoming = float(stat.get("Salable_inv", 0) or 0), float(stat.get("Incoming", 0) or 0)
+    opening, rows = on_hand, []
+    for i, row in future.reset_index(drop=True).iterrows():
+        inbound = incoming if include_incoming and i + 1 == int(receipt_month) else 0.0
+        available_units, demand = opening + inbound, float(row["Forecast_unconstrained"] or 0)
+        fulfillable, ending = min(demand, available_units), max(available_units - demand, 0.0)
+        rows.append({"Month": row["Month"], "Opening": opening, "Incoming": inbound, "Demand forecast": demand, "Fulfillable target": fulfillable, "Lost / delayed units": max(demand - available_units, 0.0), "Ending inventory": ending})
+        opening = ending
+    plan = pd.DataFrame(rows)
+    plan_cards = st.columns(4)
+    plan_cards[0].metric("Current salable", fmt_number(on_hand))
+    plan_cards[1].metric("Incoming in source", fmt_number(incoming))
+    plan_cards[2].metric("Fulfillable · 6M", fmt_number(plan["Fulfillable target"].sum() if not plan.empty else 0))
+    plan_cards[3].metric("Supply gap · 6M", fmt_number(plan["Lost / delayed units"].sum() if not plan.empty else 0))
+    if not plan.empty:
+        fig = go.Figure()
+        fig.add_bar(x=plan["Month"], y=plan["Demand forecast"], name="Unconstrained demand", marker_color="#93C5FD")
+        fig.add_bar(x=plan["Month"], y=plan["Fulfillable target"], name="Fulfillable", marker_color=PALETTE["green"])
+        fig.add_scatter(x=plan["Month"], y=plan["Ending inventory"], name="Ending inventory", mode="lines+markers", line=dict(color=PALETTE["red"], width=3, dash="dash"))
+        fig.update_layout(title="Demand, fulfillable target and projected inventory", barmode="group", yaxis_title="Units")
+        st.plotly_chart(chart_style(fig, 430), width="stretch")
+        st.dataframe(plan.round(0), width="stretch", hide_index=True)
+    with st.expander("Model evidence and selection audit"):
+        metrics = TABLES["forecast_backtest_sku_model"]
+        st.dataframe(metrics[metrics["SKU"].astype(str).eq(sku)].sort_values("WAPE"), width="stretch", hide_index=True)
+
+
 def data_quality() -> None:
     st.subheader("Data freshness and coverage")
     cards = st.columns(5)
     cards[0].metric("Sales freshness", QUALITY["latest_sales_date"])
-    cards[1].metric("Current sales SKUs", f"{QUALITY['sales_sku']:,}")
+    cards[1].metric("Commercial SKUs", f"{QUALITY['commercial_sku']:,}")
     cards[2].metric("Target SKUs", f"{QUALITY['target_sku']:,}")
-    cards[3].metric("Sales coverage", fmt_pct(QUALITY["sales_target_sku_coverage"]))
+    cards[3].metric("PIC mapped SKUs", f"{QUALITY['commercial_pic_mapped_sku']:,}")
     cards[4].metric("Inventory coverage", fmt_pct(QUALITY["inventory_target_sku_coverage"]))
-    st.markdown('<div class="warning"><b>Coverage gap:</b> The latest hourly file covers about 65% of target SKUs. Portfolio totals should be read as “covered SKUs,” not the complete 1,200-SKU target portfolio. Listing health and ranking/keyword are visibly labeled simulated.</div>', unsafe_allow_html=True)
+    if "daily_rows" in QUALITY:
+        st.caption(f"Daily mart: {QUALITY['daily_rows']:,} rows · {QUALITY['daily_sku']:,} SKUs · {QUALITY['daily_min_date']} → {QUALITY['daily_max_date']} · {QUALITY['forecast_method']}")
+    st.markdown(f'<div class="warning"><b>Scope note:</b> Commercial history contains {QUALITY["commercial_sku"]:,} SKUs; {QUALITY["commercial_pic_unmapped_sku"]:,} are marked N/A because they are absent from the current 1,200-SKU Target mapping. September 2026 is partial. Listing health and ranking/keyword remain visibly labeled simulated.</div>', unsafe_allow_html=True)
     definitions = pd.DataFrame([{"Metric": key, "Definition": value} for key, value in QUALITY["metric_definitions"].items()])
     st.dataframe(definitions, width="stretch", hide_index=True)
     st.subheader("How to update the latest numbers")
@@ -598,8 +878,10 @@ def data_quality() -> None:
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
-if page == "Executive Overview":
-    executive_overview()
+if page == "Commercial Intelligence":
+    commercial_intelligence()
+elif page == "Daily Forecast & Supply":
+    daily_forecast_supply()
 elif page == "ASIN 360":
     asin_360()
 elif page == "Inventory & Forecast":

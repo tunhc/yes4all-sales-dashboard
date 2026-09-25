@@ -56,6 +56,7 @@ def build() -> None:
     inventory_history_path = UPLOAD / "Inv đầu kỳ Weekly.xlsx"
     hourly_path = UPLOAD / "SSO Data Extraction Hourly -- hourly (21).xlsx"
     ads_path = UPLOAD / "Y4A_Advertising_Audit_Report_WORKING_CURRENT.xlsx"
+    commercial_sales_path = UPLOAD / "Yes4All_Data sales 2023 up to Aug312026.xlsx"
 
     # Target and six-month supply plan.
     target = pd.read_excel(target_path, sheet_name="SSO_US_Oct_Target_SKU_Monthly", header=1, dtype={"SKU": str, "ASIN": str})
@@ -197,6 +198,159 @@ def build() -> None:
     sales["Ad_orders"] = ad_orders
     sales["CTR"] = np.where(ad_impressions > 0, ad_clicks / ad_impressions, np.nan)
     sales["Ad_CVR"] = np.where(ad_clicks > 0, ad_orders / ad_clicks, np.nan)
+
+    # Commercial sales history: authoritative monthly data through Aug-2026,
+    # then retain the existing hourly source for Sep-2026 and roll it to month.
+    # Team/PIC is mapped strictly by SKU from the target workbook; unmatched = N/A.
+    commercial_raw = pd.read_excel(
+        commercial_sales_path,
+        sheet_name="Export",
+        dtype={"SKU": str, "ASIN": str},
+    )
+    commercial_raw = commercial_raw.rename(
+        columns={
+            "Month": "Day",
+            "Ordered GMV": "Ordered_GMV",
+            "Total Promo": "Total_Promo",
+            "Total ADS": "Total_ADS",
+        }
+    )
+    commercial_raw["Day"] = pd.to_datetime(commercial_raw["Day"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    commercial_raw["SKU"] = clean_text(commercial_raw["SKU"])
+    commercial_raw["ASIN"] = clean_text(commercial_raw["ASIN"])
+    commercial_raw = commercial_raw[
+        commercial_raw["Day"].notna()
+        & commercial_raw["SKU"].notna()
+        & commercial_raw["Dept"].astype("string").str.strip().eq("SSO")
+        & commercial_raw["Country"].astype("string").str.strip().eq("USA")
+        & commercial_raw["Day"].lt(pd.Timestamp("2026-09-01"))
+    ].copy()
+
+    commercial_numeric = [
+        "Glance_views", "Ordered_units", "Ordered_revenue", "Ordered_nmv",
+        "Shipped_units", "Shipped_revenue", "Shipped_nmv", "Ordered_GMV",
+        "Total_Promo", "Price_discount_spend", "Best_deal_spend",
+        "Lightning_deal_spend", "VM_promo_spend", "Coupon_spend", "Total_ADS",
+        "sb_spend", "sd_spend", "sp_spend", "dsp_spend", "aff_spend",
+        "Sb_clicks", "Sd_clicks", "Sp_clicks", "Dsp_clicks", "Aff_clicks",
+        "Sb_impressions", "Sd_impressions", "Sp_impressions", "Dsp_impressions", "Aff_impressions",
+        "Aff_ordered_nmv", "Dsp_ordered_nmv", "Sb_ordered_nmv", "Sd_ordered_nmv", "Sp_ordered_nmv",
+        "Aff_ordered_units", "Dsp_ordered_units", "Sb_ordered_units", "Sd_ordered_units", "Sp_ordered_units",
+        "Aff_orders", "Dsp_orders", "Sb_orders", "Sd_orders", "Sp_orders",
+    ]
+    numeric(commercial_raw, commercial_numeric)
+
+    dimension_map = target[
+        ["SKU", "product_name", "product_line", "category", "team", "channel"]
+    ].drop_duplicates("SKU")
+    source_dimensions = commercial_raw[["SKU", "product_name", "product_line"]].rename(
+        columns={"product_name": "source_product_name", "product_line": "source_product_line"}
+    )
+    commercial_raw = commercial_raw.drop(columns=["product_name", "product_line"]).merge(
+        dimension_map,
+        on="SKU",
+        how="left",
+        validate="many_to_one",
+    ).merge(
+        source_dimensions.drop_duplicates("SKU", keep="last"),
+        on="SKU",
+        how="left",
+        validate="many_to_one",
+    )
+    commercial_raw["product_name"] = commercial_raw["product_name"].fillna(commercial_raw["source_product_name"]).fillna(commercial_raw["SKU"])
+    commercial_raw["product_line"] = commercial_raw["product_line"].fillna(commercial_raw["source_product_line"]).fillna("Unmapped")
+    commercial_raw["category"] = commercial_raw["category"].fillna("Unmapped")
+    commercial_raw["team"] = commercial_raw["team"].fillna("N/A")
+    commercial_raw["channel"] = commercial_raw["channel"].fillna("N/A")
+    commercial_raw["data_source"] = "Monthly sales through Aug-2026"
+
+    # Preserve the existing September data, aggregated from daily to monthly.
+    september = sales[sales["Day"].ge(pd.Timestamp("2026-09-01"))].copy()
+    september["Day"] = september["Day"].dt.to_period("M").dt.to_timestamp()
+    september["Glance_views"] = 0.0
+    september["Ordered_revenue"] = september["Ordered_GMV"]
+    september["Shipped_units"] = 0.0
+    september["Shipped_revenue"] = 0.0
+    september["Shipped_nmv"] = 0.0
+    september["Price_discount_spend"] = september.get("price_discount_spend", 0.0)
+    september["Best_deal_spend"] = september.get("best_deal_spend", 0.0)
+    september["Lightning_deal_spend"] = september.get("lightning_deal_spend", 0.0)
+    september["VM_promo_spend"] = september.get("vm_promo_spend", 0.0)
+    september["Coupon_spend"] = september.get("coupon_spend", 0.0)
+    september["dsp_spend"] = 0.0
+    september["aff_spend"] = 0.0
+    for prefix in ["Dsp", "Aff"]:
+        for suffix in ["clicks", "impressions", "ordered_nmv", "ordered_units", "orders"]:
+            september[f"{prefix}_{suffix}"] = 0.0
+    september["Sb_clicks"] = september.get("sb_clicks", 0.0)
+    september["Sd_clicks"] = september.get("sd_clicks", 0.0)
+    september["Sp_clicks"] = september.get("sp_clicks", 0.0)
+    september["Sb_impressions"] = september.get("sb_impressions", 0.0)
+    september["Sd_impressions"] = september.get("sd_impressions", 0.0)
+    september["Sp_impressions"] = september.get("sp_impressions", 0.0)
+    september["Sb_ordered_nmv"] = september.get("sb_ordered_nmv", 0.0)
+    september["Sd_ordered_nmv"] = september.get("sd_ordered_nmv", 0.0)
+    september["Sp_ordered_nmv"] = september.get("sp_ordered_nmv", 0.0)
+    september["Sb_ordered_units"] = september.get("sb_ordered_units", 0.0)
+    september["Sd_ordered_units"] = september.get("sd_ordered_units", 0.0)
+    september["Sp_ordered_units"] = september.get("sp_ordered_units", 0.0)
+    september["Sb_orders"] = september.get("sb_orders", 0.0)
+    september["Sd_orders"] = september.get("sd_orders", 0.0)
+    september["Sp_orders"] = september.get("sp_orders", 0.0)
+    september["data_source"] = "Existing Sep-2026 hourly data (monthly roll-up)"
+
+    commercial_columns = [
+        "Day", "SKU", "ASIN", "product_name", "product_line", "category", "team", "channel",
+        "Glance_views", "Ordered_units", "Ordered_revenue", "Ordered_nmv", "Shipped_units",
+        "Shipped_revenue", "Shipped_nmv", "Ordered_GMV", "Total_Promo", "Price_discount_spend",
+        "Best_deal_spend", "Lightning_deal_spend", "VM_promo_spend", "Coupon_spend", "Total_ADS",
+        "sb_spend", "sd_spend", "sp_spend", "dsp_spend", "aff_spend",
+        "Sb_clicks", "Sd_clicks", "Sp_clicks", "Dsp_clicks", "Aff_clicks",
+        "Sb_impressions", "Sd_impressions", "Sp_impressions", "Dsp_impressions", "Aff_impressions",
+        "Aff_ordered_nmv", "Dsp_ordered_nmv", "Sb_ordered_nmv", "Sd_ordered_nmv", "Sp_ordered_nmv",
+        "Aff_ordered_units", "Dsp_ordered_units", "Sb_ordered_units", "Sd_ordered_units", "Sp_ordered_units",
+        "Aff_orders", "Dsp_orders", "Sb_orders", "Sd_orders", "Sp_orders", "data_source",
+    ]
+    for column in commercial_columns:
+        if column not in september.columns:
+            september[column] = pd.NA if column in {"product_name", "product_line", "category", "team", "channel", "data_source"} else 0.0
+        if column not in commercial_raw.columns:
+            commercial_raw[column] = pd.NA if column in {"product_name", "product_line", "category", "team", "channel", "data_source"} else 0.0
+    commercial = pd.concat(
+        [commercial_raw[commercial_columns], september[commercial_columns]],
+        ignore_index=True,
+    )
+    commercial["team"] = commercial["team"].replace({"Unmapped": "N/A"}).fillna("N/A")
+    commercial["channel"] = commercial["channel"].replace({"Unmapped": "N/A"}).fillna("N/A")
+
+    group_dimensions = ["Day", "SKU", "ASIN", "product_name", "product_line", "category", "team", "channel", "data_source"]
+    group_metrics = [column for column in commercial_columns if column not in group_dimensions]
+    commercial = commercial.groupby(group_dimensions, as_index=False, dropna=False)[group_metrics].sum()
+    commercial["Ad_clicks"] = commercial[["Sb_clicks", "Sd_clicks", "Sp_clicks", "Dsp_clicks", "Aff_clicks"]].sum(axis=1)
+    commercial["Ad_impressions"] = commercial[["Sb_impressions", "Sd_impressions", "Sp_impressions", "Dsp_impressions", "Aff_impressions"]].sum(axis=1)
+    commercial["Ad_orders"] = commercial[["Sb_orders", "Sd_orders", "Sp_orders", "Dsp_orders", "Aff_orders"]].sum(axis=1)
+    commercial["Ad_attributed_units"] = commercial[["Sb_ordered_units", "Sd_ordered_units", "Sp_ordered_units", "Dsp_ordered_units", "Aff_ordered_units"]].sum(axis=1)
+    commercial["Ad_attributed_nmv"] = commercial[["Sb_ordered_nmv", "Sd_ordered_nmv", "Sp_ordered_nmv", "Dsp_ordered_nmv", "Aff_ordered_nmv"]].sum(axis=1)
+    commercial["MKT_spend"] = commercial["Total_ADS"] + commercial["Total_Promo"]
+    commercial["ASP"] = np.where(commercial["Ordered_units"] != 0, commercial["Ordered_GMV"] / commercial["Ordered_units"], np.nan)
+    commercial["Ads_pct_GMV"] = np.where(commercial["Ordered_GMV"] > 0, commercial["Total_ADS"] / commercial["Ordered_GMV"], np.nan)
+    commercial["Promo_pct_GMV"] = np.where(commercial["Ordered_GMV"] > 0, commercial["Total_Promo"] / commercial["Ordered_GMV"], np.nan)
+    commercial["MKT_pct_GMV"] = np.where(commercial["Ordered_GMV"] > 0, commercial["MKT_spend"] / commercial["Ordered_GMV"], np.nan)
+    commercial["Ads_CPU"] = np.where(commercial["Ordered_units"] > 0, commercial["Total_ADS"] / commercial["Ordered_units"], np.nan)
+    commercial["Promo_CPU"] = np.where(commercial["Ordered_units"] > 0, commercial["Total_Promo"] / commercial["Ordered_units"], np.nan)
+    commercial["MKT_CPU"] = np.where(commercial["Ordered_units"] > 0, commercial["MKT_spend"] / commercial["Ordered_units"], np.nan)
+    commercial["Ad_attributed_CPU"] = np.where(commercial["Ad_attributed_units"] > 0, commercial["Total_ADS"] / commercial["Ad_attributed_units"], np.nan)
+    commercial["Ad_units_share"] = np.where(commercial["Ordered_units"] > 0, commercial["Ad_attributed_units"] / commercial["Ordered_units"], np.nan)
+    commercial["ROAS_attributed"] = np.where(commercial["Total_ADS"] > 0, commercial["Ad_attributed_nmv"] / commercial["Total_ADS"], np.nan)
+    commercial["ACOS_attributed"] = np.where(commercial["Ad_attributed_nmv"] > 0, commercial["Total_ADS"] / commercial["Ad_attributed_nmv"], np.nan)
+    commercial["Conversion_proxy"] = np.where(commercial["Glance_views"] > 0, commercial["Ordered_units"] / commercial["Glance_views"], np.nan)
+    commercial["CTR"] = np.where(commercial["Ad_impressions"] > 0, commercial["Ad_clicks"] / commercial["Ad_impressions"], np.nan)
+    commercial["Ad_CVR"] = np.where(commercial["Ad_clicks"] > 0, commercial["Ad_orders"] / commercial["Ad_clicks"], np.nan)
+    commercial["Year"] = commercial["Day"].dt.year
+    commercial["Month"] = commercial["Day"].dt.month
+    commercial["YearMonth"] = commercial["Day"].dt.to_period("M").astype(str)
+    commercial["Promo_units"] = np.nan
+    commercial["promo_units_definition"] = "Unavailable in source"
 
     # Current inventory. Y4A stock is a shared SKU pool repeated over ASIN rows: use MAX at SKU grain.
     inv = pd.read_excel(inventory_path, sheet_name="report", header=3, dtype={"SKU": str, "ASIN": str})
@@ -400,12 +554,30 @@ def build() -> None:
         "campaign_rows_us_non_test": int(len(ads)),
         "listing_health_classification": "simulated_demo",
         "ranking_keyword_classification": "simulated_demo",
+        "commercial_sales_min": pd.Timestamp(commercial["Day"].min()).date().isoformat(),
+        "commercial_sales_max": pd.Timestamp(commercial["Day"].max()).date().isoformat(),
+        "commercial_rows": int(len(commercial)),
+        "commercial_sku": int(commercial["SKU"].nunique()),
+        "commercial_asin": int(commercial["ASIN"].nunique()),
+        "commercial_pic_mapped_sku": int(commercial.loc[commercial["team"] != "N/A", "SKU"].nunique()),
+        "commercial_pic_unmapped_sku": int(commercial.loc[commercial["team"] == "N/A", "SKU"].nunique()),
+        "commercial_team_distribution": {
+            str(key): int(value) for key, value in commercial.groupby("team")["SKU"].nunique().items()
+        },
         "metric_definitions": {
             "baseline_units": "Baseline forecast supplied in target workbook",
             "war_map_units": "Potential units supplied in target workbook",
             "inventory_constrained_target_units": "min(War Map units, recalculated opening inventory + usable incoming), rolled forward monthly",
             "frozen_status": "Procurement flexibility flag: Frozen means no additional purchasing is assumed beyond currently usable incoming",
             "sell_through_proxy": "September ordered units divided by September opening inventory; receipts-to-date are unavailable",
+            "ASP": "Ordered GMV divided by ordered units",
+            "Ads_pct_GMV": "Total ADS divided by ordered GMV",
+            "Promo_pct_GMV": "Total Promo divided by ordered GMV",
+            "MKT_pct_GMV": "(Total ADS + Total Promo) divided by ordered GMV",
+            "MKT_CPU": "(Total ADS + Total Promo) divided by ordered units",
+            "Ad_attributed_units": "Sum of SB, SD, SP, DSP and affiliate attributed ordered units",
+            "Promo_units": "Not available in the supplied source; no proxy is presented as actual",
+            "planning_calculator": "Historical spend-rate benchmark for planning; descriptive/correlational, not a causal sales guarantee",
         },
     }
 
@@ -423,6 +595,7 @@ def build() -> None:
         "ranking_keyword_demo.parquet": ranking,
         "sales_history_sku.parquet": history_sku,
         "sales_history_asin.parquet": history_asin,
+        "sales_commercial_monthly.parquet": commercial,
     }
 
     bundle_path = OUT / "app_data_v2.zip"
