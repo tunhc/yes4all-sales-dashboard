@@ -54,7 +54,7 @@ def build_daily(history_dir: Path, current: pd.DataFrame, target: pd.DataFrame) 
     }
     raw = raw.rename(columns=rename)
     numeric = [
-        "Glance_views", "Ordered_units", "Ordered_nmv", "Ordered_GMV", "Total_Promo", "Total_ADS",
+        "Glance_views", "Ordered_units", "Ordered_revenue", "Ordered_nmv", "Ordered_GMV", "Total_Promo", "Total_ADS",
         "price_discount_spend", "best_deal_spend", "lightning_deal_spend", "vm_promo_spend",
         "coupon_spend", "sb_spend", "sd_spend", "sp_spend", "dsp_spend", "aff_spend",
     ]

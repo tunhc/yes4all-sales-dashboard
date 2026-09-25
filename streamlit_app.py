@@ -89,6 +89,8 @@ st.markdown(
 
 def bundle_path() -> Path:
     candidates = [
+        Path(__file__).resolve().parent / "app_data_v4.zip",
+        Path(__file__).resolve().parent / "data" / "app_data_v4.zip",
         Path(__file__).resolve().parent / "app_data_v3.zip",
         Path(__file__).resolve().parent / "data" / "app_data_v3.zip",
         Path(__file__).resolve().parent / "app_data_v2.zip",
@@ -99,40 +101,59 @@ def bundle_path() -> Path:
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    raise FileNotFoundError("Không tìm thấy app_data_v2.zip cạnh streamlit_app.py hoặc trong thư mục data.")
+    raise FileNotFoundError("Không tìm thấy app_data_v4.zip/app_data_v3.zip cạnh streamlit_app.py hoặc trong thư mục data.")
 
 
-@st.cache_data(show_spinner="Đang nạp Data Mart V2...")
-def load_bundle(path: str, modified_ns: int) -> tuple[dict[str, pd.DataFrame], dict]:
+@st.cache_data(show_spinner=False)
+def bundle_manifest(path: str, modified_ns: int) -> tuple[list[str], dict]:
     del modified_ns
-    tables: dict[str, pd.DataFrame] = {}
     with zipfile.ZipFile(path) as archive:
-        for name in archive.namelist():
-            if name.endswith(".parquet"):
-                tables[name.removesuffix(".parquet")] = pd.read_parquet(io.BytesIO(archive.read(name)))
+        names = [name.removesuffix(".parquet") for name in archive.namelist() if name.endswith(".parquet")]
         quality = json.loads(archive.read("quality_summary.json").decode("utf-8"))
-    for frame in tables.values():
-        for column in ["Day", "month", "Month", "snapshot_date"]:
-            if column in frame.columns:
-                frame[column] = pd.to_datetime(frame[column], errors="coerce")
-    return tables, quality
+    return names, quality
 
 
-def fmt_number(value: float, digits: int = 1) -> str:
+@st.cache_resource(show_spinner=False, max_entries=24)
+def load_table(path: str, modified_ns: int, table_name: str) -> pd.DataFrame:
+    del modified_ns
+    with zipfile.ZipFile(path) as archive:
+        frame = pd.read_parquet(io.BytesIO(archive.read(f"{table_name}.parquet")))
+    for column in ["Day", "month", "Month", "snapshot_date"]:
+        if column in frame.columns:
+            frame[column] = pd.to_datetime(frame[column], errors="coerce")
+    return frame
+
+
+class LazyTables:
+    def __init__(self, path: Path, names: list[str]):
+        self.path = path
+        self.names = names
+        self.modified_ns = path.stat().st_mtime_ns
+
+    def __getitem__(self, name: str) -> pd.DataFrame:
+        if name not in self.names:
+            raise KeyError(name)
+        return load_table(str(self.path), self.modified_ns, name)
+
+    def get(self, name: str, default=None):
+        return self[name] if name in self.names else default
+
+    def items(self):
+        for name in self.names:
+            yield name, self[name]
+
+
+def fmt_number(value: float, digits: int = 0) -> str:
     if value is None or pd.isna(value):
         return "—"
-    value = float(value)
-    if abs(value) >= 1_000_000:
-        return f"{value / 1_000_000:.{digits}f}M"
-    if abs(value) >= 1_000:
-        return f"{value / 1_000:.{digits}f}K"
-    return f"{value:,.0f}"
+    return f"{float(value):,.0f}"
 
 
 def fmt_money(value: float) -> str:
     if value is None or pd.isna(value):
         return "—"
-    return f"${fmt_number(value)}"
+    value = float(value)
+    return f"-${abs(value):,.0f}" if value < 0 else f"${value:,.0f}"
 
 
 def fmt_pct(value: float, digits: int = 1) -> str:
@@ -198,6 +219,11 @@ def section(title: str, caption: str | None = None) -> None:
         st.caption(caption)
 
 
+def chart_help(text: str) -> None:
+    safe = str(text).replace('"', '&quot;')
+    st.markdown(f'<div style="text-align:right;margin-top:-2.1rem;margin-bottom:.35rem"><span title="{safe}" style="cursor:help;font-size:1.05rem">❓</span></div>', unsafe_allow_html=True)
+
+
 def build_action_queue(tables: dict[str, pd.DataFrame], acos_limit: float = 0.35) -> pd.DataFrame:
     actions = []
     listing = tables["listing_health_demo"]
@@ -238,8 +264,8 @@ def build_action_queue(tables: dict[str, pd.DataFrame], acos_limit: float = 0.35
 
 
 DATA_PATH = bundle_path()
-TABLES, QUALITY = load_bundle(str(DATA_PATH), DATA_PATH.stat().st_mtime_ns)
-CURRENT_SALES = TABLES["sales_current"]
+TABLE_NAMES, QUALITY = bundle_manifest(str(DATA_PATH), DATA_PATH.stat().st_mtime_ns)
+TABLES = LazyTables(DATA_PATH, TABLE_NAMES)
 SALES = TABLES["sales_commercial_monthly"]
 
 st.markdown(
@@ -256,16 +282,18 @@ page = st.segmented_control(
     "Navigation",
     ["Commercial Intelligence", "Daily Forecast & Supply", "ASIN 360", "Inventory & Forecast", "Sales & Target", "Ads Performance", "Action Center", "Data Quality"],
     default="Commercial Intelligence",
+    key="nav_page",
     label_visibility="collapsed",
 )
 
 date_min = SALES["Day"].min().date()
-date_max = SALES["Day"].max().date()
+date_max = max(SALES["Day"].max().date(), pd.Timestamp(QUALITY["latest_sales_date"]).date())
+default_start = max(date_min, pd.Timestamp(year=date_max.year, month=1, day=1).date())
 with st.container():
     st.markdown('<div class="filter-shell">', unsafe_allow_html=True)
     row1 = st.columns([1.3, 1.45, 1.15, 1.05, 1.8], gap="small")
     with row1[0]:
-        selected_dates = st.date_input("Time range", value=(date_min, date_max), min_value=date_min, max_value=date_max)
+        selected_dates = st.date_input("Time range", value=(default_start, date_max), min_value=date_min, max_value=date_max)
     all_product_lines = sorted(SALES["product_line"].dropna().astype(str).unique().tolist())
     with row1[1]:
         selected_product_lines = st.multiselect("Product line", all_product_lines, placeholder="All product lines")
@@ -276,7 +304,7 @@ with st.container():
     with row1[4]:
         search_text = st.text_input("Fast search", placeholder="Type SKU, ASIN, product or keyword...", help="Searches a compact index and returns at most 50 matches; it does not render a full SKU list.")
 
-    search_source = TABLES.get("sales_team_daily", SALES)
+    search_source = TABLES.get("search_index", SALES)
     search_columns = [c for c in ["SKU", "ASIN", "product_name", "product_line", "team", "channel"] if c in search_source]
     search_index = search_source[search_columns].fillna("").astype(str).drop_duplicates().reset_index(drop=True)
     search_index["_label"] = search_index.apply(
@@ -336,6 +364,9 @@ def commercial_intelligence() -> None:
     ads_gmv = safe_divide(ads, gmv)
     promo_gmv = safe_divide(promo, gmv)
     cpu = safe_divide(mkt, units)
+    cm3 = current["CM3"].sum(min_count=1)
+    cm3_gmv = safe_divide(cm3, current.loc[current["CM3_costed"], "Ordered_GMV"].sum())
+    cm3_coverage = safe_divide(current.loc[current["CM3_costed"], "Ordered_GMV"].sum(), gmv)
 
     prior_start = pd.Timestamp(start_date) - pd.DateOffset(years=1)
     prior_end = pd.Timestamp(end_date) - pd.DateOffset(years=1)
@@ -350,24 +381,27 @@ def commercial_intelligence() -> None:
     prior_units = prior["Ordered_units"].sum()
     prior_ads = prior["Total_ADS"].sum()
     prior_promo = prior["Total_Promo"].sum()
+    prior_cm3 = prior["CM3"].sum(min_count=1)
     prior_asp = safe_divide(prior_gmv, prior_units)
     prior_mkt_gmv = safe_divide(prior_ads + prior_promo, prior_gmv)
 
-    columns = st.columns(4)
+    columns = st.columns(5)
     values = [
         ("Ordered GMV", fmt_money(gmv), yoy_delta(gmv, prior_gmv)),
         ("Ordered units", fmt_number(units), yoy_delta(units, prior_units)),
         ("ASP", fmt_money(asp), yoy_delta(asp, prior_asp)),
-        ("Glance views", fmt_number(views), None),
+        ("CM3", fmt_money(cm3), yoy_delta(cm3, prior_cm3)),
+        ("CM3 / costed GMV", fmt_pct(cm3_gmv), None),
     ]
     for column, (label, value, delta) in zip(columns, values):
         column.metric(label, value, delta=delta)
-    columns = st.columns(4)
+    columns = st.columns(5)
     values = [
         ("Ad spend / GMV", fmt_pct(ads_gmv), yoy_delta(ads_gmv, safe_divide(prior_ads, prior_gmv))),
         ("Promo / GMV", fmt_pct(promo_gmv), yoy_delta(promo_gmv, safe_divide(prior_promo, prior_gmv))),
         ("MKT / GMV", fmt_pct(mkt_gmv), yoy_delta(mkt_gmv, prior_mkt_gmv)),
         ("MKT CPU", fmt_money(cpu), None),
+        ("CM3 GMV coverage", fmt_pct(cm3_coverage), None),
     ]
     for column, (label, value, delta) in zip(columns, values):
         column.metric(label, value, delta=delta, delta_color="inverse" if label in {"Ad spend / GMV", "Promo / GMV", "MKT / GMV", "MKT CPU"} else "normal")
@@ -375,88 +409,96 @@ def commercial_intelligence() -> None:
     scope_days = max((pd.Timestamp(end_date) - pd.Timestamp(start_date)).days + 1, 1)
     st.markdown(
         f'<div class="callout"><b>Current view:</b> {scope_days} calendar days, {current["SKU"].nunique():,} SKUs and {current["ASIN"].nunique():,} ASINs. '
-        f'Paid-attributed units: {ad_units:,.0f}. September 2026 is partial through {QUALITY["latest_sales_date"]}; YoY that includes September is therefore directional.</div>',
+        f'Paid-attributed units: {ad_units:,.0f}. CM3 covers {fmt_pct(cm3_coverage)} of filtered GMV; uncovered rows are excluded, not treated as zero. September 2026 is partial through {QUALITY["latest_sales_date"]}.</div>',
         unsafe_allow_html=True,
     )
 
-    monthly = current.groupby("Day", as_index=False).agg(
-        GMV=("Ordered_GMV", "sum"), Units=("Ordered_units", "sum"), Views=("Glance_views", "sum"),
-        Ads=("Total_ADS", "sum"), Promo=("Total_Promo", "sum"), Ad_units=("Ad_attributed_units", "sum"),
+    daily = apply_dimensions(
+        TABLES["sales_team_daily"], selected_product_lines, selected_teams, selected_channels,
+        selected_skus, selected_asins, effective_search,
     )
-    monthly["ASP"] = np.where(monthly["Units"] != 0, monthly["GMV"] / monthly["Units"], np.nan)
-    monthly["MKT_GMV"] = np.where(monthly["GMV"] > 0, (monthly["Ads"] + monthly["Promo"]) / monthly["GMV"], np.nan)
-    left, right = st.columns([1.6, 1], gap="large")
-    with left:
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=monthly["Day"], y=monthly["GMV"], name="GMV", marker_color=PALETTE["blue"]))
-        fig.add_trace(go.Scatter(x=monthly["Day"], y=monthly["Units"], name="Units", yaxis="y2", mode="lines+markers", line=dict(color=PALETTE["teal"], width=3)))
-        fig.update_layout(title="Monthly GMV and units", yaxis=dict(title="GMV (USD)"), yaxis2=dict(title="Units", overlaying="y", side="right", showgrid=False))
-        st.plotly_chart(chart_style(fig, 410), width="stretch")
-    with right:
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=monthly["Day"], y=monthly["Ads"], name="Ads", marker_color=PALETTE["purple"]))
-        fig.add_trace(go.Bar(x=monthly["Day"], y=monthly["Promo"], name="Promo", marker_color=PALETTE["amber"]))
-        fig.add_trace(go.Scatter(x=monthly["Day"], y=monthly["MKT_GMV"], name="MKT / GMV", yaxis="y2", line=dict(color=PALETTE["red"], width=3)))
-        fig.update_layout(title="Marketing investment and efficiency", barmode="stack", yaxis=dict(title="Spend (USD)"), yaxis2=dict(title="MKT / GMV", overlaying="y", side="right", tickformat=".0%", showgrid=False))
-        st.plotly_chart(chart_style(fig, 410), width="stretch")
-
-    section("Portfolio map", "Bubble size = ordered units; color = MKT/GMV. Use PIC and Product Line filters above to isolate ownership.")
-    by_line = current.groupby(["team", "product_line"], as_index=False).agg(
+    daily = filter_dates(daily, start_date, end_date)
+    daily_view = daily.groupby("Day", as_index=False).agg(
         GMV=("Ordered_GMV", "sum"), Units=("Ordered_units", "sum"), Ads=("Total_ADS", "sum"),
-        Promo=("Total_Promo", "sum"), Views=("Glance_views", "sum"), Ad_units=("Ad_attributed_units", "sum"),
+        Promo=("Total_Promo", "sum"), CM3=("CM3", lambda s: s.sum(min_count=1)), Costed_GMV=("Ordered_GMV", lambda s: s[daily.loc[s.index, "CM3_costed"]].sum()),
+    )
+    daily_view["MKT_GMV"] = np.where(daily_view["GMV"] > 0, (daily_view["Ads"] + daily_view["Promo"]) / daily_view["GMV"], np.nan)
+    daily_view["CM3_GMV"] = np.where(daily_view["Costed_GMV"] > 0, daily_view["CM3"] / daily_view["Costed_GMV"], np.nan)
+    section("Daily overall", "The daily source covers the 163-SKU Tu team scope; portfolio headline metrics above retain the broader commercial mart.")
+    chart_help("Bars show daily GMV. The red line is total marketing spend divided by GMV. The green line is CM3 divided by GMV for rows with a valid cost stack. Compare line movements with GMV, but do not interpret co-movement as causality.")
+    fig = go.Figure()
+    fig.add_bar(x=daily_view["Day"], y=daily_view["GMV"], name="$ GMV", marker_color="#93C5FD")
+    fig.add_scatter(x=daily_view["Day"], y=daily_view["MKT_GMV"], name="% MKT / GMV", yaxis="y2", line=dict(color=PALETTE["red"], width=2))
+    fig.add_scatter(x=daily_view["Day"], y=daily_view["CM3_GMV"], name="% CM3", yaxis="y2", line=dict(color=PALETTE["green"], width=2))
+    fig.update_layout(title="Daily GMV, marketing intensity and CM3", yaxis=dict(title="GMV (USD)", tickprefix="$", tickformat=",.0f"), yaxis2=dict(title="Rate", overlaying="y", side="right", tickformat=".0%", showgrid=False))
+    st.plotly_chart(chart_style(fig, 430), width="stretch")
+
+    section("Top Product Line contribution", "Box size = GMV contribution; color = CM3%. Hover to inspect GMV, CPU, MKT/GMV and CM3.")
+    chart_help("Large boxes contribute more GMV. Green indicates stronger CM3%; red indicates weaker or negative CM3%. A large red box is a high-priority margin review; a small green box is healthy but not yet material.")
+    by_line = current.groupby(["product_line"], as_index=False).agg(
+        GMV=("Ordered_GMV", "sum"), Units=("Ordered_units", "sum"), Ads=("Total_ADS", "sum"),
+        Promo=("Total_Promo", "sum"), CM3=("CM3", lambda s: s.sum(min_count=1)),
+        Costed_GMV=("Ordered_GMV", lambda s: s[current.loc[s.index, "CM3_costed"]].sum()),
     )
     by_line["ASP"] = np.where(by_line["Units"] != 0, by_line["GMV"] / by_line["Units"], np.nan)
     by_line["MKT_GMV"] = np.where(by_line["GMV"] > 0, (by_line["Ads"] + by_line["Promo"]) / by_line["GMV"], np.nan)
-    fig = px.scatter(
-        by_line[(by_line["GMV"] > 0) & (by_line["Units"] > 0)], x="Units", y="GMV", size="Units", color="MKT_GMV",
-        hover_name="product_line", hover_data=["team", "ASP", "Ads", "Promo", "Ad_units"],
-        color_continuous_scale=["#16A34A", "#F59E0B", "#DC2626"], title="Product Line scale × GMV × marketing intensity",
-    )
+    by_line["MKT_CPU"] = np.where(by_line["Units"] > 0, (by_line["Ads"] + by_line["Promo"]) / by_line["Units"], np.nan)
+    by_line["CM3_pct_GMV"] = np.where(by_line["Costed_GMV"] > 0, by_line["CM3"] / by_line["Costed_GMV"], np.nan)
+    by_line = by_line[by_line["GMV"] > 0].nlargest(20, "GMV")
+    fig = px.treemap(by_line, path=["product_line"], values="GMV", color="CM3_pct_GMV", color_continuous_scale=["#DC2626", "#F59E0B", "#16A34A"], color_continuous_midpoint=0, custom_data=["GMV", "MKT_CPU", "MKT_GMV", "CM3", "CM3_pct_GMV", "Units"])
+    fig.update_traces(hovertemplate="<b>%{label}</b><br>GMV: $%{customdata[0]:,.0f}<br>MKT CPU: $%{customdata[1]:,.0f}<br>MKT / GMV: %{customdata[2]:.1%}<br>CM3: $%{customdata[3]:,.0f}<br>CM3 / GMV: %{customdata[4]:.1%}<br>Units: %{customdata[5]:,.0f}<extra></extra>")
+    fig.update_layout(title="Top 20 Product Lines by GMV contribution")
     st.plotly_chart(chart_style(fig, 500), width="stretch")
 
-    section("Commercial relationship map", "Spearman correlation across SKU-month-ASIN rows. Correlation is descriptive; it does not prove Ads or Promo caused sales.")
-    correlation_fields = {
-        "Views": "Glance_views", "Units": "Ordered_units", "GMV": "Ordered_GMV", "ASP": "ASP",
-        "Ads": "Total_ADS", "Promo": "Total_Promo", "Ad units": "Ad_attributed_units",
-        "Ads/GMV": "Ads_pct_GMV", "Promo/GMV": "Promo_pct_GMV", "MKT CPU": "MKT_CPU",
-    }
-    corr_source = current[list(correlation_fields.values())].replace([np.inf, -np.inf], np.nan)
-    corr_source = corr_source.dropna(how="all")
-    corr = corr_source.corr(method="spearman", min_periods=30)
-    corr.index = correlation_fields.keys()
-    corr.columns = correlation_fields.keys()
-    c1, c2 = st.columns([1.3, 1], gap="large")
+    section("Marketing relationship views", "Each dot is a SKU in the selected period. These are descriptive relationships, not causal uplift estimates.")
+    sku_rel = current.groupby(["SKU", "product_name", "product_line"], as_index=False).agg(
+        GMV=("Ordered_GMV", "sum"), Units=("Ordered_units", "sum"), Ads=("Total_ADS", "sum"),
+        Promo=("Total_Promo", "sum"), CM3=("CM3", lambda s: s.sum(min_count=1)),
+        Costed_GMV=("Ordered_GMV", lambda s: s[current.loc[s.index, "CM3_costed"]].sum()),
+    )
+    sku_rel["ASP"] = sku_rel["GMV"].div(sku_rel["Units"].replace(0, np.nan))
+    sku_rel["MKT_CPU"] = (sku_rel["Ads"] + sku_rel["Promo"]).div(sku_rel["Units"].replace(0, np.nan))
+    sku_rel["MKT_CPU_bubble"] = sku_rel["MKT_CPU"].clip(lower=0).fillna(0) + 0.01
+    sku_rel["CM3_CPU"] = sku_rel["CM3"].div(sku_rel["Units"].replace(0, np.nan))
+    sku_rel["CM3_pct_GMV"] = sku_rel["CM3"].div(sku_rel["Costed_GMV"].replace(0, np.nan))
+    sku_rel = sku_rel.replace([np.inf, -np.inf], np.nan).nlargest(500, "GMV")
+    c1, c2 = st.columns(2, gap="large")
     with c1:
-        fig = px.imshow(corr, text_auto=".2f", zmin=-1, zmax=1, color_continuous_scale="RdBu_r", title="Correlation matrix")
-        st.plotly_chart(chart_style(fig, 520), width="stretch")
+        chart_help("Dots above the diagonal tendency have relatively more Ads than Promo; dots to the right rely more on Promo. Bubble size is GMV and color is CM3%. Use this to identify expensive marketing mixes, not to claim one spend type caused sales.")
+        fig = px.scatter(sku_rel, x="Promo", y="Ads", size="GMV", color="CM3_pct_GMV", hover_name="SKU", hover_data=["product_name", "product_line", "GMV", "Units"], color_continuous_scale=["#DC2626", "#F59E0B", "#16A34A"], color_continuous_midpoint=0, title="Promo vs Ads investment by SKU")
+        fig.update_xaxes(title="Promo spend (USD)", tickprefix="$", tickformat=",.0f")
+        fig.update_yaxes(title="Ads spend (USD)", tickprefix="$", tickformat=",.0f")
+        st.plotly_chart(chart_style(fig, 470), width="stretch")
     with c2:
-        relationship_rows = [
-            {"Relationship": "Views → Units", "What it means": "Traffic-to-demand linkage; read together with conversion proxy."},
-            {"Relationship": "ASP ↔ Units", "What it means": "Price-volume co-movement; negative can signal price sensitivity or mix shift."},
-            {"Relationship": "Ads → Ad units", "What it means": "Paid acquisition scale; evaluate with attributed CPU and ROAS."},
-            {"Relationship": "Ads → GMV", "What it means": "Commercial co-movement; large SKUs naturally spend and sell more."},
-            {"Relationship": "Promo → Units", "What it means": "Promotion intensity versus volume; not a causal uplift estimate."},
-            {"Relationship": "MKT CPU → GMV", "What it means": "Cost required per ordered unit versus achieved scale."},
-        ]
-        st.dataframe(pd.DataFrame(relationship_rows), width="stretch", hide_index=True, height=480)
+        chart_help("X is average selling price. Y is CM3 per sold unit. Bubble size is marketing cost per unit. A large bubble with low CM3/unit signals that marketing is consuming margin; a higher ASP does not automatically mean better CM3.")
+        fig = px.scatter(sku_rel.dropna(subset=["ASP", "CM3_CPU", "MKT_CPU"]), x="ASP", y="CM3_CPU", size="MKT_CPU_bubble", color="CM3_pct_GMV", hover_name="SKU", hover_data={"product_name": True, "product_line": True, "GMV": ":$,.0f", "Units": ":,.0f", "MKT_CPU": ":$,.0f", "MKT_CPU_bubble": False}, color_continuous_scale=["#DC2626", "#F59E0B", "#16A34A"], color_continuous_midpoint=0, title="Selling price × marketing cost × CM3")
+        fig.add_hline(y=0, line_dash="dash", line_color=PALETTE["red"])
+        fig.update_xaxes(title="ASP (USD)", tickprefix="$", tickformat=",.0f")
+        fig.update_yaxes(title="CM3 per unit (USD)", tickprefix="$", tickformat=",.0f")
+        st.plotly_chart(chart_style(fig, 470), width="stretch")
 
     section("PIC scorecard")
     pic = current.groupby("team", as_index=False).agg(
         GMV=("Ordered_GMV", "sum"), Units=("Ordered_units", "sum"), Ads=("Total_ADS", "sum"),
-        Promo=("Total_Promo", "sum"), Ad_units=("Ad_attributed_units", "sum"), SKU=("SKU", "nunique"),
+        Promo=("Total_Promo", "sum"), CM3=("CM3", lambda s: s.sum(min_count=1)),
+        Costed_GMV=("Ordered_GMV", lambda s: s[current.loc[s.index, "CM3_costed"]].sum()),
+        Ad_units=("Ad_attributed_units", "sum"), SKU=("SKU", "nunique"),
     )
     pic["ASP"] = np.where(pic["Units"] != 0, pic["GMV"] / pic["Units"], np.nan)
     pic["Ads_GMV"] = np.where(pic["GMV"] > 0, pic["Ads"] / pic["GMV"], np.nan)
     pic["Promo_GMV"] = np.where(pic["GMV"] > 0, pic["Promo"] / pic["GMV"], np.nan)
     pic["MKT_GMV"] = np.where(pic["GMV"] > 0, (pic["Ads"] + pic["Promo"]) / pic["GMV"], np.nan)
     pic["MKT_CPU"] = np.where(pic["Units"] > 0, (pic["Ads"] + pic["Promo"]) / pic["Units"], np.nan)
+    pic["CM3_GMV"] = np.where(pic["Costed_GMV"] > 0, pic["CM3"] / pic["Costed_GMV"], np.nan)
     st.dataframe(pic.sort_values("GMV", ascending=False), width="stretch", hide_index=True, column_config={
-        "GMV": st.column_config.NumberColumn(format="$%.0f"), "ASP": st.column_config.NumberColumn(format="$%.2f"),
+        "GMV": st.column_config.NumberColumn(format="$%.0f"), "ASP": st.column_config.NumberColumn(format="$%.0f"),
         "Ads": st.column_config.NumberColumn(format="$%.0f"), "Promo": st.column_config.NumberColumn(format="$%.0f"),
+        "CM3": st.column_config.NumberColumn(format="$%.0f"),
         "Ads_GMV": st.column_config.NumberColumn("Ads / GMV", format="percent"),
         "Promo_GMV": st.column_config.NumberColumn("Promo / GMV", format="percent"),
         "MKT_GMV": st.column_config.NumberColumn("MKT / GMV", format="percent"),
-        "MKT_CPU": st.column_config.NumberColumn(format="$%.2f"),
+        "MKT_CPU": st.column_config.NumberColumn(format="$%.0f"),
+        "CM3_GMV": st.column_config.NumberColumn("CM3 / GMV", format="percent"),
     })
 
     section("Sales investment planner", "Example: choose 10 units and $25 ASP. Budgets use historical ratios in the filtered scope; they are planning benchmarks, not guaranteed causal requirements.")
@@ -493,6 +535,38 @@ def commercial_intelligence() -> None:
     for column, (label, value) in zip(planner_cards, planner_values):
         column.metric(label, value)
     st.caption("Promo Units are not calculated because the source has no promotion-attributed unit field. Ads attributed units are source-backed from SB/SD/SP/DSP/Aff.")
+
+    section("SKU detail", "Operational table at the selected time range. Currency is rounded to whole USD; units are rounded to whole units.")
+    sku_detail = current.groupby(["SKU", "product_name", "product_line", "team", "channel"], as_index=False).agg(
+        Units=("Ordered_units", "sum"), GMV=("Ordered_GMV", "sum"), Ads=("Total_ADS", "sum"),
+        Promo=("Total_Promo", "sum"), CM3=("CM3", lambda s: s.sum(min_count=1)),
+        Costed_GMV=("Ordered_GMV", lambda s: s[current.loc[s.index, "CM3_costed"]].sum()),
+        Ad_units=("Ad_attributed_units", "sum"), Views=("Glance_views", "sum"),
+    )
+    sku_detail["ASP"] = sku_detail["GMV"].div(sku_detail["Units"].replace(0, np.nan))
+    sku_detail["MKT_GMV"] = (sku_detail["Ads"] + sku_detail["Promo"]).div(sku_detail["GMV"].replace(0, np.nan))
+    sku_detail["MKT_CPU"] = (sku_detail["Ads"] + sku_detail["Promo"]).div(sku_detail["Units"].replace(0, np.nan))
+    sku_detail["CM3_GMV"] = sku_detail["CM3"].div(sku_detail["Costed_GMV"].replace(0, np.nan))
+    sku_detail["CM3_coverage"] = sku_detail["Costed_GMV"].div(sku_detail["GMV"].replace(0, np.nan))
+    inv = TABLES["inventory_current_sku"][["SKU", "current_inventory", "incoming_inventory", "moc"]].drop_duplicates("SKU")
+    sku_detail = sku_detail.merge(inv, on="SKU", how="left")
+    sku_detail = sku_detail[["SKU", "product_name", "product_line", "team", "channel", "current_inventory", "incoming_inventory", "moc", "Units", "GMV", "ASP", "Ads", "Promo", "MKT_GMV", "MKT_CPU", "Ad_units", "CM3", "CM3_GMV", "CM3_coverage", "Views"]]
+    st.dataframe(
+        sku_detail.sort_values("GMV", ascending=False), width="stretch", hide_index=True, height=620,
+        column_config={
+            "current_inventory": st.column_config.NumberColumn("Inventory", format="%.0f"),
+            "incoming_inventory": st.column_config.NumberColumn("Incoming", format="%.0f"),
+            "moc": st.column_config.NumberColumn("MOC", format="%.1f"),
+            "Units": st.column_config.NumberColumn(format="%.0f"), "Ad_units": st.column_config.NumberColumn(format="%.0f"),
+            "Views": st.column_config.NumberColumn(format="%.0f"),
+            "GMV": st.column_config.NumberColumn(format="$%.0f"), "ASP": st.column_config.NumberColumn(format="$%.0f"),
+            "Ads": st.column_config.NumberColumn(format="$%.0f"), "Promo": st.column_config.NumberColumn(format="$%.0f"),
+            "MKT_CPU": st.column_config.NumberColumn(format="$%.0f"), "CM3": st.column_config.NumberColumn(format="$%.0f"),
+            "MKT_GMV": st.column_config.NumberColumn("MKT / GMV", format="percent"),
+            "CM3_GMV": st.column_config.NumberColumn("CM3 / GMV", format="percent"),
+            "CM3_coverage": st.column_config.ProgressColumn("CM3 cost coverage", min_value=0, max_value=1, format="percent"),
+        },
+    )
 
 
 def asin_360() -> None:
@@ -857,6 +931,13 @@ def data_quality() -> None:
     cards[4].metric("Inventory coverage", fmt_pct(QUALITY["inventory_target_sku_coverage"]))
     if "daily_rows" in QUALITY:
         st.caption(f"Daily mart: {QUALITY['daily_rows']:,} rows · {QUALITY['daily_sku']:,} SKUs · {QUALITY['daily_min_date']} → {QUALITY['daily_max_date']} · {QUALITY['forecast_method']}")
+    if "cm3_gmv_coverage" in QUALITY:
+        st.markdown(
+            f'<div class="callout"><b>CM3 engine:</b> {QUALITY["cm3_source"]}<br>'
+            f'{QUALITY["cm3_formula"]}<br><b>Historical GMV coverage:</b> {fmt_pct(QUALITY["cm3_gmv_coverage"])}. '
+            f'{QUALITY["cm3_limitations"]}</div>',
+            unsafe_allow_html=True,
+        )
     st.markdown(f'<div class="warning"><b>Scope note:</b> Commercial history contains {QUALITY["commercial_sku"]:,} SKUs; {QUALITY["commercial_pic_unmapped_sku"]:,} are marked N/A because they are absent from the current 1,200-SKU Target mapping. September 2026 is partial. Listing health and ranking/keyword remain visibly labeled simulated.</div>', unsafe_allow_html=True)
     definitions = pd.DataFrame([{"Metric": key, "Definition": value} for key, value in QUALITY["metric_definitions"].items()])
     st.dataframe(definitions, width="stretch", hide_index=True)
@@ -864,18 +945,16 @@ def data_quality() -> None:
     st.markdown(
         """
         1. Export the same five source files with the same sheet/column names.
-        2. Run the supplied Colab preparation script to rebuild `app_data_v2.zip`.
-        3. In GitHub, replace only `app_data_v2.zip` and commit. Streamlit Cloud redeploys automatically.
+        2. Run `prepare_app_data.py`, then `prepare_daily_forecast.py`, then `prepare_cm3_mart.py` to rebuild `app_data_v4.zip`.
+        3. In GitHub, replace only `app_data_v4.zip` and commit. Streamlit Cloud redeploys automatically.
         4. Use the quality page to confirm freshness, SKU coverage and the simulated-data labels.
 
         A runtime file uploader is intentionally not used for the production source because uploads disappear when the Streamlit session restarts.
         """
     )
     with st.expander("Source inventory"):
-        rows = []
-        for name, frame in TABLES.items():
-            rows.append({"Table": name, "Rows": len(frame), "Columns": len(frame.columns)})
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        st.caption("Tables are listed from the ZIP manifest without loading every Parquet file into RAM.")
+        st.dataframe(pd.DataFrame({"Table": TABLE_NAMES, "Loading": "On demand"}), width="stretch", hide_index=True)
 
 
 if page == "Commercial Intelligence":

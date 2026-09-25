@@ -1,14 +1,15 @@
-# Yes4All Commerce Intelligence V3
+# Yes4All Commerce Intelligence V4
 
 ## Repository files
 
 - `streamlit_app.py`: dashboard application.
-- `app_data_v3.zip`: prepared data mart with daily sales and forecast audit tables.
+- `app_data_v4.zip`: prepared data mart with daily sales, forecast audit tables and the CM3 cost engine.
 - `requirements.txt`: Streamlit Cloud dependencies.
 - `prepare_app_data.py`: preparation script for Google Colab.
 - `prepare_daily_forecast.py`: adds the 2023–2026 daily mart and the automatic forecast/model-selection layer.
+- `prepare_cm3_mart.py`: ports the supplied V9.8 lane cost stack and creates CM3 fields plus the compact search index.
 
-Keep all three files in the repository root. In Streamlit Cloud, set the main file path to `streamlit_app.py`.
+Keep the app, V4 data bundle, requirements file and three preparation scripts in the repository root. In Streamlit Cloud, set the main file path to `streamlit_app.py`.
 
 ## Refresh
 
@@ -47,7 +48,16 @@ python prepare_daily_forecast.py \
   --output app_data_v3.zip
 ```
 
-Commit `app_data_v3.zip` with `streamlit_app.py`. The app checks V3 first and falls back to V2 only for backward compatibility.
+Then add CM3 and the search index:
+
+```bash
+python prepare_cm3_mart.py \
+  --base app_data_v3.zip \
+  --cm3-html /content/source/Y4A_CM3_by_Lane_V98_v73_Sep21_2026.html \
+  --output app_data_v4.zip
+```
+
+Commit `app_data_v4.zip` with `streamlit_app.py`. The app checks V4 first and falls back to V3/V2 only for backward compatibility.
 
 Forecast selection logic:
 
@@ -70,9 +80,19 @@ Commercial sales logic:
 - ASP = Ordered GMV / Ordered Units.
 - Ads / GMV, Promo / GMV and MKT / GMV use Ordered GMV as denominator; MKT = Ads + Promo.
 - MKT CPU = (Ads + Promo) / Ordered Units.
+- CM3 = lane-specific CM3 per unit from the supplied V9.8 HTML cost stack × actual Ordered Units. Actual period Ads% and Promo% and DI/DS True-Up are applied.
+- CM3 / GMV uses only rows with a valid cost stack. Uncovered rows are excluded rather than treated as zero; current historical GMV coverage is shown in the app.
 - Ads attributed units = SB + SD + SP + DSP + Affiliate attributed units.
 - Promo Units are unavailable in the supplied sources and are not simulated.
 - The Sales Investment Planner is a historical-ratio planning benchmark, not a causal sales guarantee.
 - Inventory-constrained target: calculated as `min(War Map units, recalculated opening units + usable incoming)` and rolled forward by month.
 - Listing health and ranking/keyword history: deterministic simulated demo data, visibly labeled in the app.
 - Sell-through proxy: September ordered units divided by September opening inventory because receipts-to-date were not supplied.
+
+## Runtime design
+
+- The ZIP manifest and small quality JSON load first; Parquet tables load only when the active page needs them.
+- Loaded tables use Streamlit resource caching, so changing filters does not repeatedly decompress Parquet files.
+- Search uses a compact distinct product index rather than scanning the full daily mart.
+- Product-line and SKU relationship charts aggregate before rendering and cap plotted points where appropriate.
+- The Data Quality page lists manifest entries without loading every table into RAM.
